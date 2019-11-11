@@ -117,11 +117,11 @@ Status TestMultipleWrites(size_t compress_input_buf_size,
   io::SnappyInputBuffer in(file_reader.get(), uncompress_input_buf_size,
                            uncompress_output_buf_size);
 
-  // Run the test twice, reseting the stream after the first attempt.
+  // Run the test twice, resetting the stream after the first attempt.
   for (int attempt = 0; attempt < 2; ++attempt) {
     string actual_result;
     for (int i = 0; i < num_writes; i++) {
-      string decompressed_output;
+      tstring decompressed_output;
       TF_RETURN_IF_ERROR(in.ReadNBytes(data.size(), &decompressed_output));
       strings::StrAppend(&actual_result, decompressed_output);
     }

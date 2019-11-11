@@ -42,6 +42,8 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "tensorflow/core/framework/node_def.pb.h"
+#include "tensorflow/core/framework/node_def_util.h"
 #include "tensorflow/core/graph/algorithm.h"
 #include "tensorflow/core/lib/gtl/map_util.h"
 #include "tensorflow/core/lib/hash/hash.h"
@@ -56,18 +58,16 @@ class OptimizerCSE {
   bool Optimize(const std::function<bool(const Node*)>& consider_fn);
 
  private:
-  struct Scratch;
-
   static size_t NodeHash(const Node* n);
-  static bool Equivalent(const Node* a, const Node* b, Scratch* s);
-  static bool EqualAttrs(const Node* a, const Node* b, Scratch* s);
+  static bool Equivalent(const Node* a, const Node* b,
+                         AttrSlice::Scratch* scratch);
 
   Graph* g_;
 };
 
 static void FillInputs(const Node* n,
-                       gtl::InlinedVector<Node*, 4>* control_edges,
-                       gtl::InlinedVector<std::pair<Node*, int>, 4>* in) {
+                       gtl::InlinedVector<const Node*, 4>* control_edges,
+                       gtl::InlinedVector<std::pair<const Node*, int>, 4>* in) {
   DCHECK_EQ(in->size(), n->num_inputs());
   control_edges->clear();
   for (const Edge* e : n->in_edges()) {
@@ -97,8 +97,8 @@ size_t OptimizerCSE::NodeHash(const Node* n) {
 
   const int N_in = n->num_inputs();
   strings::StrAppend(&str_to_hash, N_in);
-  gtl::InlinedVector<Node*, 4> control_edges;
-  gtl::InlinedVector<std::pair<Node*, int>, 4> in(N_in);
+  gtl::InlinedVector<const Node*, 4> control_edges;
+  gtl::InlinedVector<std::pair<const Node*, int>, 4> in(N_in);
   FillInputs(n, &control_edges, &in);
   for (const auto& edge : in) {
     strings::StrAppend(&str_to_hash, edge.first->id(), edge.second);
@@ -110,7 +110,7 @@ size_t OptimizerCSE::NodeHash(const Node* n) {
   // Hash the attrs.  For example, this makes sure different constants
   // end up in different hash buckets.
   string tmp;
-  for (const auto& attr : n->def().attr()) {
+  for (const auto& attr : n->attrs()) {
     tmp = attr.first;
     attr.second.AppendToString(&tmp);
     // Add hashes of attrs, so the order of attrs doesn't matter.
@@ -122,28 +122,6 @@ size_t OptimizerCSE::NodeHash(const Node* n) {
   return h;
 }
 
-struct OptimizerCSE::Scratch {
-  // For EqualAttrs():
-  string a;
-  string b;
-};
-
-bool OptimizerCSE::EqualAttrs(const Node* a, const Node* b, Scratch* scratch) {
-  if (a->def().attr_size() != b->def().attr_size()) return false;
-
-  for (const auto& attr : b->def().attr()) {
-    auto iter = a->def().attr().find(attr.first);
-    if (iter == a->def().attr().end()) return false;
-    // Note: it should be safe to compare proto serializations of the attr
-    // values since at most one field should be set in each (indeed, it
-    // should be the same field).
-    iter->second.SerializeToString(&scratch->a);
-    attr.second.SerializeToString(&scratch->b);
-    if (scratch->a != scratch->b) return false;
-  }
-  return true;
-}
-
 static bool HasRefInput(const Node* n) {
   for (auto dt : n->input_types()) {
     if (IsRefType(dt)) return true;
@@ -151,7 +129,8 @@ static bool HasRefInput(const Node* n) {
   return false;
 }
 
-bool OptimizerCSE::Equivalent(const Node* a, const Node* b, Scratch* scratch) {
+bool OptimizerCSE::Equivalent(const Node* a, const Node* b,
+                              AttrSlice::Scratch* scratch) {
   // Different op names are different
   if (a->type_string() != b->type_string()) return false;
 
@@ -164,15 +143,15 @@ bool OptimizerCSE::Equivalent(const Node* a, const Node* b, Scratch* scratch) {
 
   // Compare attrs.  Note that equal attrs implies equal input and
   // output types.
-  if (!EqualAttrs(a, b, scratch)) return false;
+  if (!a->attrs().EqualAttrs(b->attrs(), scratch)) return false;
 
   // Compare input sources
   if (a->num_inputs() != b->num_inputs()) return false;
   const int N_in = a->num_inputs();
-  gtl::InlinedVector<Node*, 4> a_control_edges;
-  gtl::InlinedVector<Node*, 4> b_control_edges;
-  gtl::InlinedVector<std::pair<Node*, int>, 4> a_in(N_in);
-  gtl::InlinedVector<std::pair<Node*, int>, 4> b_in(N_in);
+  gtl::InlinedVector<const Node*, 4> a_control_edges;
+  gtl::InlinedVector<const Node*, 4> b_control_edges;
+  gtl::InlinedVector<std::pair<const Node*, int>, 4> a_in(N_in);
+  gtl::InlinedVector<std::pair<const Node*, int>, 4> b_in(N_in);
   FillInputs(a, &a_control_edges, &a_in);
   FillInputs(b, &b_control_edges, &b_in);
   if (a_in != b_in) return false;
@@ -206,9 +185,16 @@ bool OptimizerCSE::Optimize(
   // Scratch space for Equivalent calls.  Allocated here and passed in to
   // Equivalent to avoid allocation inside the loop below.
   bool changed = false;
-  Scratch scratch;
+  AttrSlice::Scratch scratch;
   for (Node* n : order) {
     if (!n->IsOp()) continue;
+
+    // Don't prune placeholder nodes.
+    if (n->type_string() == "Placeholder" ||
+        n->type_string() == "PlaceholderV2" ||
+        n->type_string() == "PlaceholderWithDefault") {
+      continue;
+    }
 
     // See if we should consider this node at all
     if (consider_fn != nullptr && !consider_fn(n)) continue;
@@ -227,6 +213,8 @@ bool OptimizerCSE::Optimize(
       for (const Edge* e : n->out_edges()) {
         g_->AddEdge(*candidate, e->src_output(), e->dst(), e->dst_input());
       }
+
+      MergeDebugInfo(NodeDebugInfo(*n), *candidate);
       g_->RemoveNode(n);
       changed = true;
     }

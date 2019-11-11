@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +21,8 @@ from __future__ import print_function
 
 import re
 
+import six
+
 from tensorflow.python.util import tf_inspect
 
 
@@ -36,13 +39,25 @@ class PublicAPIVisitor(object):
       visitor: A visitor to call for the public API.
     """
     self._visitor = visitor
+    self._root_name = 'tf'
+
+    # Modules/classes we want to suppress entirely.
+    self._private_map = {
+        'tf': [
+            'compiler',
+            'core',
+            'python',
+        ],
+        # Some implementations have this internal module that we shouldn't
+        # expose.
+        'tf.flags': ['cpp_flags'],
+    }
 
     # Modules/classes we do not want to descend into if we hit them. Usually,
     # system modules exposed through platforms for compatibility reasons.
     # Each entry maps a module path to a name to ignore in traversal.
     self._do_not_descend_map = {
-        '': [
-            'core',
+        'tf': [
             'examples',
             'flags',  # Don't add flags
             # TODO(drpng): This can be removed once sealed off.
@@ -51,21 +66,30 @@ class PublicAPIVisitor(object):
             'pywrap_tensorflow',
             # TODO(drpng): This can be removed once sealed.
             'user_ops',
-            'python',
             'tools',
             'tensorboard',
         ],
 
-        # Some implementations have this internal module that we shouldn't
-        # expose.
-        'flags': ['cpp_flags'],
-
         ## Everything below here is legitimate.
         # It'll stay, but it's not officially part of the API.
-        'app': ['flags'],
+        'tf.app': ['flags'],
         # Imported for compatibility between py2/3.
-        'test': ['mock'],
+        'tf.test': ['mock'],
+        # Externalized modules of the Keras API.
+        'tf.keras': ['applications', 'preprocessing']
     }
+
+  @property
+  def private_map(self):
+    """A map from parents to symbols that should not be included at all.
+
+    This map can be edited, but it should not be edited once traversal has
+    begun.
+
+    Returns:
+      The map marking symbols to not include.
+    """
+    return self._private_map
 
   @property
   def do_not_descend_map(self):
@@ -79,11 +103,18 @@ class PublicAPIVisitor(object):
     """
     return self._do_not_descend_map
 
-  def _isprivate(self, name):
+  def set_root_name(self, root_name):
+    """Override the default root name of 'tf'."""
+    self._root_name = root_name
+
+  def _is_private(self, path, name, obj=None):
     """Return whether a name is private."""
     # TODO(wicke): Find out what names to exclude.
-    return (name.startswith('_') and not re.match('__.*__$', name) or
-            name in ['__base__', '__class__'])
+    del obj  # Unused.
+    return ((path in self._private_map and name in self._private_map[path]) or
+            (six.ensure_str(name).startswith('_') and
+             not re.match('__.*__$', six.ensure_str(name)) or
+             name in ['__base__', '__class__']))
 
   def _do_not_descend(self, path, name):
     """Safely queries if a specific fully qualified name should be excluded."""
@@ -94,18 +125,23 @@ class PublicAPIVisitor(object):
     """Visitor interface, see `traverse` for details."""
 
     # Avoid long waits in cases of pretty unambiguous failure.
-    if tf_inspect.ismodule(parent) and len(path.split('.')) > 10:
-      raise RuntimeError('Modules nested too deep:\n%s\n\nThis is likely a '
-                         'problem with an accidental public import.' % path)
+    if tf_inspect.ismodule(parent) and len(
+        six.ensure_str(path).split('.')) > 10:
+      raise RuntimeError('Modules nested too deep:\n%s.%s\n\nThis is likely a '
+                         'problem with an accidental public import.' %
+                         (self._root_name, path))
+
+    # Includes self._root_name
+    full_path = '.'.join([self._root_name, path]) if path else self._root_name
 
     # Remove things that are not visible.
     for name, child in list(children):
-      if self._isprivate(name):
+      if self._is_private(full_path, name, child):
         children.remove((name, child))
 
     self._visitor(path, parent, children)
 
     # Remove things that are visible, but which should not be descended into.
     for name, child in list(children):
-      if self._do_not_descend(path, name):
+      if self._do_not_descend(full_path, name):
         children.remove((name, child))

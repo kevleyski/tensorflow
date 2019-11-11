@@ -29,7 +29,7 @@ SnappyInputBuffer::SnappyInputBuffer(
       output_buffer_(new char[output_buffer_capacity_]),
       next_in_(input_buffer_.get()) {}
 
-Status SnappyInputBuffer::ReadNBytes(int64 bytes_to_read, string* result) {
+Status SnappyInputBuffer::ReadNBytes(int64 bytes_to_read, tstring* result) {
   result->clear();
   // Read as many bytes as possible from cache.
   bytes_to_read -= ReadBytesFromCache(bytes_to_read, result);
@@ -62,7 +62,7 @@ Status SnappyInputBuffer::Reset() {
 }
 
 size_t SnappyInputBuffer::ReadBytesFromCache(size_t bytes_to_read,
-                                             string* result) {
+                                             tstring* result) {
   size_t can_read_bytes = std::min(bytes_to_read, avail_out_);
   if (can_read_bytes > 0) {
     result->append(next_out_, can_read_bytes);
@@ -106,7 +106,7 @@ Status SnappyInputBuffer::Inflate() {
 
   // Output buffer must be large enough to fit the uncompressed block.
   DCHECK_GE(output_buffer_capacity_, uncompressed_length);
-  next_out_ = (char*)output_buffer_.get();
+  next_out_ = output_buffer_.get();
 
   bool status = port::Snappy_Uncompress(next_in_, compressed_block_length,
                                         output_buffer_.get());
@@ -183,7 +183,7 @@ Status SnappyInputBuffer::ReadFromFile() {
   // possible that on the last read there isn't enough data in the file to
   // fill up the buffer in which case file_->ReadNBytes would return an
   // OutOfRange error.
-  if (data.size() == 0) {
+  if (data.empty()) {
     return errors::OutOfRange("EOF reached");
   }
   if (errors::IsOutOfRange(s)) {

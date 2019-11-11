@@ -77,15 +77,76 @@ class DequantizeOpTest : public OpsTestBase {
     }
     TensorShape shape({static_cast<int64>(input.size())});
     AddInputFromArray<T>(shape, input);
-    AddInputFromArray<float>(TensorShape({1}), {min_range});
-    AddInputFromArray<float>(TensorShape({1}), {max_range});
+    AddInputFromArray<float>(TensorShape({}), {min_range});
+    AddInputFromArray<float>(TensorShape({}), {max_range});
     TF_ASSERT_OK(RunOpKernel());
     Tensor expected(allocator(), DT_FLOAT, shape);
     ComputeDequantizeMinCombinedUsingEigen<T>(GetInput(0), min_range, max_range,
                                               &expected);
     test::ExpectTensorEqual<float>(expected, *GetOutput(0));
   }
+
+  // Creates a tensor with the specified dims, using values chosen from data,
+  // multiplied by (1 + index) along the axis dimension.
+  template <typename T>
+  std::vector<T> ScalePerSliceAlongAxis(std::vector<int64> dims, int axis,
+                                        const std::vector<T>& data) {
+    uint32 seed = 123;
+    int64 out_size = 1;
+    for (int dim : dims) {
+      out_size *= dim;
+    }
+    int minor_size = 1;
+    for (int i = axis + 1; i < dims.size(); ++i) {
+      minor_size *= dims[i];
+    }
+    std::vector<T> out(out_size);
+    int num_slices = (axis == -1) ? 1 : dims[axis];
+    for (int out_idx = 0; out_idx < out_size; ++out_idx) {
+      int in_idx = rand_r(&seed) % data.size();
+      T multiplier = ((out_idx / minor_size) % num_slices) + 1;
+      out[out_idx] = data[in_idx] * multiplier;
+    }
+    return out;
+  }
+
+  template <typename T>
+  void RunDequantizeScaledTest(float min_range, float max_range, int axis,
+                               const std::vector<T>& values,
+                               const std::vector<float>& expected) {
+    const std::vector<int64> dims = {2, 3, 4, 5};
+    int num_slices = (axis == -1) ? 1 : dims[axis];
+    TF_ASSERT_OK(NodeDefBuilder("dequantize_op", "Dequantize")
+                     .Input(FakeInput(DataTypeToEnum<T>::v()))
+                     .Input(FakeInput(DT_FLOAT))
+                     .Input(FakeInput(DT_FLOAT))
+                     .Attr("T", DataTypeToEnum<T>::v())
+                     .Attr("mode", "SCALED")
+                     .Attr("axis", axis)
+                     .Finalize(node_def()));
+    TF_ASSERT_OK(InitOp());
+
+    AddInputFromArray<T>(TensorShape(dims),
+                         ScalePerSliceAlongAxis(dims, -1, values));
+    std::vector<float> min_ranges(num_slices), max_ranges(num_slices);
+    for (int slice_idx = 0; slice_idx < num_slices; ++slice_idx) {
+      min_ranges[slice_idx] = (slice_idx + 1) * min_range;
+      max_ranges[slice_idx] = (slice_idx + 1) * max_range;
+    }
+    AddInputFromArray<float>(TensorShape({num_slices}), min_ranges);
+    AddInputFromArray<float>(TensorShape({num_slices}), max_ranges);
+    TF_ASSERT_OK(RunOpKernel());
+
+    Tensor expected_tensor(allocator(), DT_FLOAT, TensorShape(dims));
+    test::FillValues<float>(&expected_tensor,
+                            ScalePerSliceAlongAxis(dims, axis, expected));
+    test::ExpectClose(expected_tensor, *GetOutput(0));
+  }
 };
+
+struct ParameterizedDequantizeOpTest
+    : public OpsTestBase,
+      public ::testing::WithParamInterface<int> {};
 
 TEST_F(DequantizeOpTest, DequantizeMinCombinedQuint8) {
   RunDequantizeMinCombinedTest<quint8>(0, 255.0f);
@@ -100,15 +161,49 @@ TEST_F(DequantizeOpTest, DequantizeMinCombinedQuint16) {
   RunDequantizeMinCombinedTest<quint16>(0, 255.0f);
 }
 
+TEST_F(DequantizeOpTest, DequantizeScaledQuint8Zero) {
+  RunDequantizeScaledTest<quint8>(-255.0f, 127.0f, -1, {0}, {0.0});
+}
+TEST_F(DequantizeOpTest, DequantizeScaledQuint8CheckIgnoresNegative) {
+  RunDequantizeScaledTest<quint8>(-512.0f, 255.0f, -1, {255}, {255.0});
+}
+TEST_F(DequantizeOpTest, DequantizeScaledQuint8ScaleDown) {
+  RunDequantizeScaledTest<quint8>(-1.0f, 2.0f, -1, {255}, {2.0});
+}
+TEST_F(DequantizeOpTest, DequantizeScaledQuint8ScaleUp) {
+  RunDequantizeScaledTest<quint8>(200.0f, 400.0f, -1, {255}, {400.0});
+}
+
+TEST_F(DequantizeOpTest, DequantizeScaledQint8Zero) {
+  RunDequantizeScaledTest<qint8>(-255.0f, 127.0f, -1, {0}, {0.0});
+}
+TEST_F(DequantizeOpTest, DequantizeScaledQint8ScaleIdentity) {
+  RunDequantizeScaledTest<qint8>(-10.0f, 127.0f, -1, {-127}, {-127.0});
+}
+TEST_F(DequantizeOpTest, DequantizeScaledQint8ScaleDown) {
+  RunDequantizeScaledTest<qint8>(-2.0f, 1.0f, -1, {-128}, {-2.0});
+}
+TEST_F(DequantizeOpTest, DequantizeScaledQint8ScaleUp) {
+  RunDequantizeScaledTest<qint8>(-1.0f, 300.0f, -1, {42}, {99.212601});
+}
+TEST_F(DequantizeOpTest, DequantizeScaledQint8Axis1) {
+  RunDequantizeScaledTest<qint8>(-12.8f, 12.7f, 1, {-20, -10, 0, 1, 10, 20},
+                                 {-2.0, -1.0, 0.0, 0.1, 1.0, 2.0});
+}
+TEST_F(DequantizeOpTest, DequantizeScaledQint8Axis3) {
+  RunDequantizeScaledTest<qint8>(-12.8f, 12.7f, 3, {-20, -10, 0, 1, 10, 20},
+                                 {-2.0, -1.0, 0.0, 0.1, 1.0, 2.0});
+}
+
 template <typename T>
 static void BM_DequantizeMinCombinedCpu(int iters) {
   auto root = Scope::NewRootScope().ExitOnError();
   const int64 num_values = 1500 * 250;
   std::vector<T> inputs;
+  inputs.reserve(num_values);
   for (int i = 0; i < num_values; ++i) inputs.push_back(i);
-  ops::Dequantize(root, test::AsTensor<T>(inputs),
-                  test::AsTensor<float>({-1.5f}),
-                  test::AsTensor<float>({20.5f}),
+  ops::Dequantize(root, test::AsTensor<T>(inputs), test::AsScalar<float>(-1.5f),
+                  test::AsScalar<float>(20.5f),
                   ops::Dequantize::Attrs().Mode("MIN_COMBINED"));
   TF_CHECK_OK(root.status());
   Graph* g = new Graph(OpRegistry::Global());
